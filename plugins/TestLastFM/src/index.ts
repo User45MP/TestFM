@@ -31,7 +31,7 @@ export { Settings } from "./Settings";
 
 export const unloads = new Set<LunaUnload>();
 
-// --- 1. NOW PLAYING NOTIFICATION (Standard Behavior) ---
+// --- 1. NOW PLAYING NOTIFICATION ---
 unloads.add(
     MediaItem.onMediaTransition(unloads, (mediaItem) => {
         makeScrobbleOpts(mediaItem)
@@ -40,25 +40,29 @@ unloads.add(
     })
 );
 
-// --- 2. STATE VARIABLES FOR SCROBBLING ---
+// --- 2. STATE VARIABLES ---
 let currentMediaItem: MediaItem | undefined;
 let lastPlayStart: number | undefined = Date.now();
 let cumulativePlaytime: number = 0;
 let alreadyScrobbled: boolean = false;
 
-const MIN_SCROBBLE_DURATION = 240000; // 4 minutes (ms)
+const MIN_SCROBBLE_DURATION = 240000; // 4 minutes
 const MIN_SCROBBLE_PERCENTAGE = 0.5;  // 50%
 
-// Initialize immediately
-MediaItem.fromPlaybackContext().then(item => { currentMediaItem = item; });
+// Initialize first song
+MediaItem.fromPlaybackContext().then(item => { 
+    currentMediaItem = item;
+    trace.log("LastFM Plugin Loaded. First song initialized.");
+});
 
-// --- 3. PAUSE/PLAY TRACKER (Fixes timing issues) ---
+// --- 3. PAUSE/PLAY TRACKER ---
 unloads.add(
     redux.intercept("playbackControls/SET_PLAYBACK_STATE", unloads, (state) => {
         if (state === "PLAYING") {
+            // Resume counting
             lastPlayStart = Date.now();
         } else {
-            // If we pause, add the time we just listened to the total
+            // Pause counting: save what we have so far
             if (lastPlayStart !== undefined) {
                 cumulativePlaytime += Date.now() - lastPlayStart;
             }
@@ -67,40 +71,47 @@ unloads.add(
     })
 );
 
-// --- 4. SCROBBLE LOGIC (Handles "Repeat One" correctly) ---
+// --- 4. SCROBBLE LOGIC (Handles Repeat One) ---
 unloads.add(
     MediaItem.onMediaTransition(unloads, async (mediaItem) => {
-        
-        // A. Check if the PREVIOUS song should be scrobbled
+        trace.log("Transition detected!");
+
+        // A. Scrobble the PREVIOUS track
         if (currentMediaItem !== undefined && !alreadyScrobbled) {
             
-            // Add any remaining time from the last session
+            // Add the final chunk of time from the song that just finished
             if (lastPlayStart !== undefined) {
                 cumulativePlaytime += Date.now() - lastPlayStart;
             }
 
             if (currentMediaItem.duration !== undefined) {
-                const longerThan4min = cumulativePlaytime >= MIN_SCROBBLE_DURATION;
-                const minPlayTime = currentMediaItem.duration * MIN_SCROBBLE_PERCENTAGE * 1000;
-                const moreThan50Percent = cumulativePlaytime >= minPlayTime;
+                const totalTimeMs = cumulativePlaytime;
+                const requiredTimeMs = currentMediaItem.duration * MIN_SCROBBLE_PERCENTAGE * 1000;
+                
+                trace.log(`Check: Listened ${totalTimeMs}ms / Required ${requiredTimeMs}ms`);
+
+                const longerThan4min = totalTimeMs >= MIN_SCROBBLE_DURATION;
+                const moreThan50Percent = totalTimeMs >= requiredTimeMs;
 
                 if (longerThan4min || moreThan50Percent) {
                     try {
                         const opts = await makeScrobbleOpts(currentMediaItem);
                         const res = await LastFM.scrobble(opts);
-                        if (res?.scrobbles) trace.log("Scrobbled", opts, res.scrobbles.scrobble);
+                        if (res?.scrobbles) trace.log("Scrobbled", opts);
                         alreadyScrobbled = true;
                     } catch (e) {
                         trace.msg.err.withContext("Failed to scrobble!")(e);
                     }
+                } else {
+                    trace.log("Not enough playtime to scrobble.");
                 }
             }
         }
 
-        // B. Reset state for the NEW song
+        // B. RESET EVERYTHING for the NEW track (or the repeat loop)
         currentMediaItem = mediaItem;
-        cumulativePlaytime = 0;
-        lastPlayStart = Date.now(); 
-        alreadyScrobbled = false;
+        cumulativePlaytime = 0;          // <--- Reset timer to 0
+        lastPlayStart = Date.now();      // <--- Start timer NOW
+        alreadyScrobbled = false;        // <--- Reset flag
     })
 );
